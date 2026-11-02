@@ -19,6 +19,7 @@ Description=On-demand SOCKS proxy via chisel
 
 [Service]
 EnvironmentFile=%h/.config/chisel-ondemand.env
+Environment=PATH=%h/.local/bin:%h/go/bin
 ExecStart=%h/.local/bin/chisel_ondemand_socks5 https://your.tunnel.com/wathever
 Restart=on-failure
 RestartSec=5
@@ -35,3 +36,5 @@ systemctl --user enable --now chisel-ondemand
 ```
 
 Obviously for this to work, the URL needs to have chisel running (or start running after it receives a HTTP request!) with the matching user and "socks" access for said user.
+
+Also, don't forget to install "chisel" to somewhere in the service's PATH.
