@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -30,16 +31,14 @@ type Chisel struct {
 	lastUserCh       chan struct{}
 }
 
-// Call while mu is held
-func (c *Chisel) setCancel(cancel context.CancelFunc) {
+func (c *Chisel) setCancelLocked(cancel context.CancelFunc) {
 	c.cancelFunc = cancel
 	c.cancelFuncNumber++
 }
 
-// Only call with mutex locked
-func (c *Chisel) launchNewChisel() {
+func (c *Chisel) launchNewChiselLocked() {
 	ctx, cancel := context.WithCancel(context.Background())
-	c.setCancel(cancel)
+	c.setCancelLocked(cancel)
 	cancelNum := c.cancelFuncNumber
 	go c.chiselWorker(ctx, cancelNum)
 }
@@ -51,40 +50,41 @@ func (c *Chisel) chiselWorker(ctx context.Context, cancelNum uint) {
 		c.conf.url,
 		fmt.Sprintf("%s:socks", c.conf.localChiselHost),
 	)
-	cmd.Run()
+	err := cmd.Run()
+	if err != nil && ctx.Err() == nil {
+		log.Printf("chisel exited: %v", err)
+	}
 
 	c.mu.Lock()
 	if c.cancelFuncNumber == cancelNum {
-		c.setCancel(nil)
+		c.setCancelLocked(nil)
 		if c.users > 0 {
-			// Oh no! Run() exitted, and somebody tried to
-			// connect again while it was dead, but cancelFunc was
-			// still set, thus no launchChisel was called, call it ourselves
-			c.launchNewChisel()
+			// Oh no! Run() exitted, and somebody was still using it
+			c.launchNewChiselLocked()
 		}
 	}
 	c.mu.Unlock()
 
 }
 
-func (c *Chisel) Ensure() {
+func (c *Chisel) Acquire() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.users++
 	if c.cancelFunc == nil {
-		c.launchNewChisel()
+		c.launchNewChiselLocked()
 	}
 }
 
-func (c *Chisel) Done() {
+func (c *Chisel) Release() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.users--
 	if c.users == 0 {
 		// note the lastUserCh is buffered, so if we cannot send into
-		// it, somebody already notified the "Done"! So just skip
+		// it, somebody already notified the "Release"! So just skip
 		select {
 		case c.lastUserCh <- struct{}{}:
 		default:
@@ -92,57 +92,59 @@ func (c *Chisel) Done() {
 	}
 }
 
-func serveStop(ctx context.Context, chisel *Chisel) {
+func (c *Chisel) workerStop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-chisel.lastUserCh:
+		case <-c.lastUserCh:
 			// Maybe no more users, launch a little timer...
-			time.Sleep(30 * time.Second)
-			chisel.mu.Lock()
-			if chisel.users == 0 {
-				// Only if no new user came, we kill it
-				chisel.cancelFunc()
-				chisel.setCancel(nil)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(30 * time.Second):
 			}
-			chisel.mu.Unlock()
+			c.mu.Lock()
+			if c.users == 0 && c.cancelFunc != nil {
+				// Only if no new user came, we kill it
+				c.cancelFunc()
+				c.setCancelLocked(nil)
+			}
+			c.mu.Unlock()
 		}
 	}
 }
 
 func serveRequest(ctx context.Context, chisel *Chisel, conn net.Conn) {
-	chisel.Ensure()
-	defer chisel.Done()
+	chisel.Acquire()
+	defer chisel.Release()
+	defer conn.Close()
 }
 
 func main() {
 	chiselUser := os.Getenv("CHISEL_USER")
 	if len(chiselUser) == 0 {
-		println("Must provide CHISEL_USER")
-		os.Exit(1)
+		log.Fatal("must provide CHISEL_USER")
 	}
 
 	chiselPass := os.Getenv("CHISEL_PASS")
 	if len(chiselPass) == 0 {
-		println("Must provide CHISEL_PASS")
-		os.Exit(1)
+		log.Fatal("must provide CHISEL_PASS")
 	}
 
 	if len(os.Args) < 2 {
-		println("Must provide chisel URL as argument")
-		os.Exit(1)
+		log.Fatal("must provide chisel URL as argument")
 	}
 
 	localHost := os.Getenv("SOCKS_LOCAL_HOST")
 	if len(localHost) == 0 {
-		println("Using default address for SOCKS :1080")
+		log.Println("using default address for SOCKS :1080")
 		localHost = ":1080"
 	}
 
 	localChiselHost := os.Getenv("CHISEL_LOCAL_HOST")
 	if len(localChiselHost) == 0 {
-		println("Using default address for local chisel host localhost:1081")
+		log.Println("using default address for local chisel host localhost:1081")
 		localChiselHost = "localhost:1081"
 	}
 
@@ -164,18 +166,17 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go serveStop(ctx, &chisel)
+	go chisel.workerStop(ctx)
 
 	ln, err := net.Listen("tcp", localHost)
 	if err != nil {
-		println("Unable to start listener at", localHost)
-		os.Exit(1)
+		log.Fatalf("unable to start listener at %s: %v", localHost, err)
 	}
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			println("Unable to handle connection", err)
+			log.Println("unable to handle connection", err)
 			continue
 		}
 
