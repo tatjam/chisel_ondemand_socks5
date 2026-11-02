@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -115,10 +116,51 @@ func (c *Chisel) workerStop(ctx context.Context) {
 	}
 }
 
+func pipe(a net.Conn, b net.Conn) {
+	// whichever direction finishes first closes the other end,
+	// which instantly unblocks it. Thus at the end of this function,
+	// both "threads" are dead
+	go func() {
+		io.Copy(a, b)
+		a.Close()
+	}()
+	io.Copy(b, a)
+	b.Close()
+}
+
+// Tries to initiate a connection with chisel with retry so if chisel
+// is starting we don't fail instantly
+func dialChisel(ctx context.Context, addr string) (net.Conn, error) {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		conn, err := new(net.Dialer).DialContext(ctx, "tcp", addr)
+		if err == nil {
+			return conn, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, err
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
 func serveRequest(ctx context.Context, chisel *Chisel, conn net.Conn) {
 	chisel.Acquire()
 	defer chisel.Release()
-	defer conn.Close()
+
+	toChisel, err := dialChisel(ctx, chisel.conf.localChiselHost)
+	if err != nil {
+		log.Printf("unable to open dialer to chisel: %v", err)
+		return
+	}
+
+	// Note conn is closed by pipe
+	pipe(toChisel, conn)
 }
 
 func main() {
