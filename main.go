@@ -51,10 +51,13 @@ func (c *Chisel) chiselWorker(ctx context.Context, cancelNum uint) {
 		c.conf.url,
 		fmt.Sprintf("%s:socks", c.conf.localChiselHost),
 	)
+	log.Printf("chisel is now running")
 	err := cmd.Run()
 	if err != nil && ctx.Err() == nil {
 		log.Printf("chisel exited: %v", err)
 	}
+
+	log.Printf("chisel is now stopped")
 
 	c.mu.Lock()
 	if c.cancelFuncNumber == cancelNum {
@@ -99,6 +102,7 @@ func (c *Chisel) workerStop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-c.lastUserCh:
+			log.Printf("no more users, maybe stopping...")
 			// Maybe no more users, launch a little timer...
 			select {
 			case <-ctx.Done():
